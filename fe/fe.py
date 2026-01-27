@@ -832,6 +832,7 @@ def display_signal_reasoning(result):
 
 # Helper functions
 def make_request(endpoint, method="GET", data=None, params=None):
+    """Make API request with enhanced error handling for DataSectors API"""
     headers = {}
     if st.session_state.token:
         headers["Authorization"] = f"Bearer {st.session_state.token}"
@@ -851,11 +852,25 @@ def make_request(endpoint, method="GET", data=None, params=None):
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 401:
-            st.error("Session expired. Please login again.")
+            st.error("⚠️ Session expired. Please login again.")
             st.session_state.token = None
             st.session_state.username = None
             st.session_state.page = 'login'
             st.rerun()
+        elif response.status_code == 429:
+            st.error("⚠️ DataSectors API rate limit reached. Please try again in a moment.")
+            return None
+        elif response.status_code == 400:
+            error_detail = "Bad request"
+            try:
+                error_detail = response.json().get('detail', 'Invalid request parameters')
+            except:
+                error_detail = response.text if response.text else "Bad request"
+            st.error(f"❌ Invalid request: {error_detail}")
+            return None
+        elif response.status_code == 404:
+            st.error("❌ Symbol not found in DataSectors API. Please try a different search term.")
+            return None
         else:
             error_detail = "Unknown error"
             try:
@@ -863,16 +878,20 @@ def make_request(endpoint, method="GET", data=None, params=None):
             except:
                 error_detail = response.text if response.text else "Unknown error"
             
-            st.error(f"Error: {error_detail}")
+            st.error(f"❌ API Error: {error_detail}")
             return None
     except requests.exceptions.Timeout:
-        st.error("⏱️ Server sedang sibuk (timeout)...")
+        st.error("⏱️ Server timeout. DataSectors API is slow to respond. Please try again.")
         return None
     except requests.exceptions.ConnectionError:
-        st.error("🔌 Connection error. Please make sure the backend server is running on http://localhost:8000")
+        st.error("🔌 Cannot connect to backend server. Make sure it's running on http://localhost:2401")
         return None
     except requests.exceptions.JSONDecodeError:
-        st.error("❌ Invalid response from server...")
+        st.error("❌ Invalid response format from server. Please try again.")
+        return None
+    except Exception as e:
+        st.error(f"❌ Unexpected error: {str(e)}")
+        return None
 
 def make_request_with_retry(endpoint, retries=3):
     for attempt in range(retries):
@@ -1444,15 +1463,21 @@ def scan_page():
         # Search box for symbols
         search_term = st.text_input("Search Ticker", placeholder="e.g., BTC, ETH")
         
-        @st.cache_data(ttl=3600)
+        @st.cache_data(ttl=1800, show_spinner="Fetching symbols from DataSectors...")
         def get_cached_symbols(search_term):
+            """Cache symbol search results for 30 minutes from DataSectors API"""
             return make_request(f"/symbols?search={search_term}&limit=500" if search_term else "/symbols?limit=500")
         
         symbols_data = get_cached_symbols(search_term)
         symbols = [s['symbol'] for s in symbols_data['symbols']] if symbols_data else []
         
-        if symbols_data and 'exchanges' in symbols_data:
-            st.caption(f"📊 {symbols_data['total']} tickers from {', '.join(symbols_data['exchanges'])}")
+        if symbols_data and 'source' in symbols_data:
+            total = symbols_data.get('total', 0)
+            source = symbols_data.get('source', 'DataSectors')
+            st.caption(f"📊 {total} tickers | 🔌 {source}")
+        else:
+            if symbols_data is None:
+                st.info("💡 Try searching for a cryptocurrency (e.g., Bitcoin, Ethereum) powered by DataSectors", icon="ℹ️")
         
         selected_symbol = st.selectbox(
             "Select Ticker",
@@ -2129,7 +2154,11 @@ def watchlist_page():
             symbols_data = make_request(f"/symbols?search={search_term}&limit=500" if search_term else "/symbols?limit=500")
             symbols = [s['symbol'] for s in symbols_data['symbols']] if symbols_data else []
             
-            selected_ticker = st.selectbox("Select Ticker", options=symbols)
+            # Show data source
+            if symbols_data and symbols:
+                st.caption(f"🔌 Powered by {symbols_data.get('source', 'DataSectors')}")
+            
+            selected_ticker = st.selectbox("Select Ticker", options=symbols, help="Data from DataSectors API")
         
         with col2:
             timeframe = st.selectbox(
@@ -2389,10 +2418,17 @@ def multi_timeframe_page():
         symbols_data = make_request(f"/symbols?search={search_term}&limit=500" if search_term else "/symbols?limit=500")
         symbols = [s['symbol'] for s in symbols_data['symbols']] if symbols_data else []
         
+        # Show data source info
+        if symbols_data and symbols:
+            source = symbols_data.get('source', 'DataSectors')
+            total = symbols_data.get('total', len(symbols))
+            st.caption(f"🔌 {total} symbols from {source}")
+        
         selected_symbol = st.selectbox(
             "Select Ticker",
             options=symbols,
-            index=0 if symbols else None
+            index=0 if symbols else None,
+            help="Data sourced from DataSectors API"
         )
         
         st.write("**Select Timeframes**")
@@ -2602,7 +2638,7 @@ def indonesia_stocks_page():
             st.error("Failed to load stock list")
             return
         
-        # Timeframe selection (Twelvedata supported intervals)
+        # Timeframe selection (DataSectors supported intervals)
         interval = st.selectbox(
             "Timeframe",
             options=["1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mo"],
@@ -3271,9 +3307,9 @@ def sidebar():
         
         st.subheader("ℹ️ Info")
         st.write("**Features:**")
-        st.write("• 75+ Cryptocurrencies")
-        st.write("• CryptoCompare API")
-        st.write("• Up to 2000 candles")
+        st.write("• 100+ Cryptocurrencies")
+        st.write("• DataSectors API (Professional)")
+        st.write("• Up to 5000 candles")
         st.write("• 7 Timeframes")
         st.write("• 16+ Indicators")
         st.write("• SMI Indicator")
@@ -3284,10 +3320,11 @@ def sidebar():
         
         st.markdown("---")
         st.caption("📊 **Data Source:**")
-        st.caption("✅ CryptoCompare API")
-        st.caption("✅ No API key required")
-        st.caption("✅ 75+ cryptocurrencies")
-        st.caption("✅ Up to 2000 candles")
+        st.caption("✅ DataSectors API")
+        st.caption("✅ Professional market data")
+        st.caption("✅ 100+ cryptocurrencies")
+        st.caption("✅ Up to 5000 candles")
+        st.caption("✅ Real-time & historical data")
         st.caption("✅ Real OHLCV data")
         
         st.markdown("---")
