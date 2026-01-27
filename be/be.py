@@ -58,16 +58,34 @@ SECRET_KEY = "your-secret-key-change-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
-# Alpha Vantage Configuration (Free tier: 5 calls/min, 500/day)
-ALPHA_VANTAGE_API_KEY = "demo"  # Replace with your key from https://www.alphavantage.co
-ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+# DataSectors API Configuration
+DATASECTORS_API_KEY = "ds_live_4Im1sd1FgunC4eOnInBMGAYb6Jb2Ed6r"
+DATASECTORS_BASE_URL = "https://api.datasectors.com"
+DATASECTORS_HEADERS = {
+    "X-API-Key": DATASECTORS_API_KEY,
+    "Content-Type": "application/json"
+}
 
-# Polygon.io Configuration (Free tier: 5 API calls/min)
-POLYGON_API_KEY = "YOUR_POLYGON_API_KEY"  # Get from https://polygon.io
-POLYGON_BASE_URL = "https://api.polygon.io/v1"
+# Rate limiting for DataSectors API
+LAST_API_CALL = {'datasectors': 0}
 
-# Rate limiting for APIs
-LAST_API_CALL = {'alpha_vantage': 0, 'polygon': 0}
+# Cache untuk API results dengan TTL
+SEARCH_CACHE = {}
+SEARCH_CACHE_TTL = 3600  # 1 hour
+
+# Popular cryptocurrencies cache (untuk /api/symbols tanpa search)
+POPULAR_SYMBOLS_CACHE = {
+    'data': [],
+    'timestamp': 0,
+    'ttl': 1800  # 30 minutes
+}
+
+# Indonesia stocks cache (untuk /api/stocks/indonesia/list)
+INDONESIA_STOCKS_CACHE = {
+    'data': {},
+    'timestamp': 0,
+    'ttl': 3600  # 1 hour - stocks change less frequently
+}
 
 # Database Init
 def init_db():
@@ -326,7 +344,6 @@ def get_conversation_history(user_id: int, conversation_id: str, limit: int = 10
         print(f"Error getting conversation history: {str(e)}")
         return []
 
-# CryptoCompare API Functions (Free, No API Key Needed!)
 def rate_limit_check(api_name: str, min_interval: float = 0.2):
     """Check rate limit (minimum 0.2s between calls = 5 calls/sec)"""
     global LAST_API_CALL
@@ -339,373 +356,385 @@ def rate_limit_check(api_name: str, min_interval: float = 0.2):
     
     LAST_API_CALL[api_name] = time.time()
 
-def fetch_alpha_vantage_intraday(symbol: str, interval: str = "5min", limit: int = 1000) -> Optional[pd.DataFrame]:
+# DataSectors API Functions
+def search_datasectors_symbol(query: str) -> dict:
     """
-    Fetch intraday OHLC data dari Alpha Vantage
-    Supports: 1min, 5min, 15min, 30min, 60min
-    Returns: DataFrame dengan columns [timestamp, open, high, low, close, volume]
+    Search for symbol/ticker in DataSectors Market with caching
+    Returns: List of symbols with format EXCHANGE:SYMBOL
     """
+    global SEARCH_CACHE
+    
+    # Check cache first
+    cache_key = f"search_{query.lower()}"
+    if cache_key in SEARCH_CACHE:
+        cached_data = SEARCH_CACHE[cache_key]
+        if time.time() - cached_data['timestamp'] < SEARCH_CACHE_TTL:
+            print(f"✓ Cache hit for '{query}'")
+            return cached_data['result']
+    
     try:
-        rate_limit_check('alpha_vantage', min_interval=0.2)
+        url = f"{DATASECTORS_BASE_URL}/api/search/market"
+        params = {"query": query}
         
-        # Normalize interval
-        valid_intraday = ['1min', '5min', '15min', '30min', '60min']
-        if interval not in valid_intraday:
-            interval = '5min'
-        
-        # Format symbol untuk Alpha Vantage
-        ticker = symbol.split('.')[0]  # Remove .JK suffix jika ada
-        
-        params = {
-            'function': f'TIME_SERIES_INTRADAY',
-            'symbol': ticker,
-            'interval': interval,
-            'apikey': ALPHA_VANTAGE_API_KEY,
-            'outputsize': 'full'  # Get max data (up to 1000 candles)
-        }
-        
-        print(f"🔄 Fetching {ticker} intraday {interval} from Alpha Vantage...")
-        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"❌ Alpha Vantage HTTP {response.status_code}: {response.text[:200]}")
-            return None
-        
+        print(f"🔄 Searching {query} on DataSectors...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
         data = response.json()
         
-        # Check untuk error atau API call limit
-        if 'Error Message' in data:
-            print(f"❌ Alpha Vantage Error: {data['Error Message']}")
-            return None
-        
-        if 'Note' in data:  # Rate limit
-            print(f"⚠️ Alpha Vantage Rate Limit: {data['Note']}")
-            return None
-        
-        # Extract time series
-        time_series_key = None
-        for key in data.keys():
-            if 'Time Series' in key:
-                time_series_key = key
-                break
-        
-        if not time_series_key or not data[time_series_key]:
-            print(f"❌ No data available for {ticker}")
-            return None
-        
-        ts = data[time_series_key]
-        
-        # Convert ke DataFrame
-        df_data = []
-        for timestamp, ohlc in ts.items():
-            df_data.append({
-                'timestamp': pd.to_datetime(timestamp),
-                'open': float(ohlc.get('1. open', 0)),
-                'high': float(ohlc.get('2. high', 0)),
-                'low': float(ohlc.get('3. low', 0)),
-                'close': float(ohlc.get('4. close', 0)),
-                'volume': float(ohlc.get('5. volume', 0))
-            })
-        
-        if not df_data:
-            print(f"❌ No valid OHLC data for {ticker}")
-            return None
-        
-        df = pd.DataFrame(df_data)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        print(f"✅ Fetched {len(df)} {interval} candles from Alpha Vantage ({ticker})")
-        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-        
-    except requests.exceptions.Timeout:
-        print(f"❌ Alpha Vantage timeout")
-        return None
-    except Exception as e:
-        print(f"❌ Alpha Vantage exception: {e}")
-        return None
-
-def fetch_alpha_vantage_daily(symbol: str, limit: int = 1000) -> Optional[pd.DataFrame]:
-    """
-    Fetch daily OHLC data dari Alpha Vantage
-    Returns: DataFrame dengan columns [timestamp, open, high, low, close, volume]
-    """
-    try:
-        rate_limit_check('alpha_vantage', min_interval=0.2)
-        
-        ticker = symbol.split('.')[0]
-        
-        params = {
-            'function': 'TIME_SERIES_DAILY',
-            'symbol': ticker,
-            'apikey': ALPHA_VANTAGE_API_KEY,
-            'outputsize': 'full'  # Dapat up to 20 years historical data
+        result = {
+            'success': True if data.get('success') else False,
+            'data': data.get('data', []),
+            'count': data.get('count', 0)
         }
         
-        print(f"🔄 Fetching {ticker} daily from Alpha Vantage...")
-        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=15)
+        # Cache the result
+        SEARCH_CACHE[cache_key] = {
+            'result': result,
+            'timestamp': time.time()
+        }
         
-        if response.status_code != 200:
-            print(f"❌ Alpha Vantage HTTP {response.status_code}")
-            return None
+        return result
+    except Exception as e:
+        print(f"❌ DataSectors search error: {e}")
+        return {'success': False, 'error': str(e), 'data': []}
+
+def fetch_datasectors_ohlcv(symbol: str, timeframe: str = 'D', range_size: int = 100) -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV data from DataSectors API (Chart Endpoint)
+    
+    Parameters:
+    - symbol: Trading pair in format EXCHANGE:SYMBOL (e.g., BINANCE:BTCUSDT, XIDX:BBCA)
+    - timeframe: D (day), W (week), M (month), or minutes (1-45), 60 (1h), 120 (2h), etc.
+    - range_size: Number of candles to fetch (1-5000)
+    
+    Returns: DataFrame with columns [timestamp, open, high, low, close, volume]
+    """
+    try:
+        url = f"{DATASECTORS_BASE_URL}/api/chart/price"
+        params = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "range": min(range_size, 5000),  # Max 5000
+            "timezone": "Asia/Jakarta"
+        }
         
+        print(f"🔄 Fetching {symbol} {timeframe} from DataSectors...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
         data = response.json()
         
-        if 'Error Message' in data or 'Note' in data:
-            print(f"❌ Alpha Vantage Error: {data.get('Error Message', data.get('Note'))}")
-            return None
-        
-        ts = data.get('Time Series (Daily)', {})
-        if not ts:
-            print(f"❌ No daily data for {ticker}")
-            return None
-        
-        df_data = []
-        for date, ohlc in ts.items():
-            df_data.append({
-                'timestamp': pd.to_datetime(date),
-                'open': float(ohlc.get('1. open', 0)),
-                'high': float(ohlc.get('2. high', 0)),
-                'low': float(ohlc.get('3. low', 0)),
-                'close': float(ohlc.get('4. close', 0)),
-                'volume': float(ohlc.get('5. volume', 0))
-            })
-        
-        if not df_data:
-            return None
-        
-        df = pd.DataFrame(df_data)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        # Limit to requested amount
-        df = df.tail(limit)
-        
-        print(f"✅ Fetched {len(df)} daily candles from Alpha Vantage ({ticker})")
-        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-        
-    except Exception as e:
-        print(f"❌ Alpha Vantage daily exception: {e}")
-        return None
-
-def fetch_polygon_intraday(symbol: str, timespan: str = "minute", multiplier: int = 5, limit: int = 1000) -> Optional[pd.DataFrame]:
-    """
-    Fetch intraday OHLC dari Polygon.io (Fallback)
-    Supports: minute (1min), 5min, 15min, 30min, hour
-    """
-    try:
-        rate_limit_check('polygon', min_interval=0.2)
-        
-        # Normalize timespan
-        timespan_map = {
-            '1min': ('minute', 1),
-            '5min': ('minute', 5),
-            '15min': ('minute', 15),
-            '30min': ('minute', 30),
-            '1h': ('hour', 1),
-            'hour': ('hour', 1),
-            '1d': ('day', 1),
-        }
-        
-        if timespan in timespan_map:
-            timespan_norm, multiplier_val = timespan_map[timespan]
+        if data.get('success') and 'data' in data:
+            ohlcv_data = data['data']
+            
+            if not ohlcv_data:
+                print(f"⚠️ No data returned for {symbol}")
+                return None
+            
+            df_data = []
+            for candle in ohlcv_data:
+                df_data.append({
+                    'timestamp': pd.to_datetime(candle.get('datetime', candle.get('time'))),
+                    'open': float(candle.get('open', 0)),
+                    'high': float(candle.get('high', 0)),
+                    'low': float(candle.get('low', 0)),
+                    'close': float(candle.get('close', 0)),
+                    'volume': float(candle.get('volume', 0))
+                })
+            
+            if df_data:
+                df = pd.DataFrame(df_data)
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                print(f"✅ Fetched {len(df)} {timeframe} candles from DataSectors ({symbol})")
+                return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            else:
+                print(f"❌ No valid OHLCV data for {symbol}")
+                return None
         else:
-            timespan_norm, multiplier_val = 'minute', 5
-        
-        ticker = symbol.split('.')[0]
-        
-        # Polygon endpoint: /v1/open-close/{stocksTicker}/{date}
-        # Untuk intraday: /v1/bars/{stocksTicker}
-        
-        # Use Aggs API untuk aggregate bars
-        from_date = (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
-        to_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-        
-        url = f"{POLYGON_BASE_URL}/bars/{ticker}"
-        
-        params = {
-            'timespan': timespan_norm,
-            'multiplier': multiplier_val,
-            'from': from_date,
-            'to': to_date,
-            'sort': 'asc',
-            'limit': 1000,
-            'apiKey': POLYGON_API_KEY
-        }
-        
-        print(f"🔄 Fetching {ticker} {timespan} from Polygon.io...")
-        response = requests.get(url, params=params, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"❌ Polygon.io HTTP {response.status_code}")
+            error = data.get('error', 'Unknown error')
+            print(f"❌ DataSectors API error: {error}")
             return None
-        
-        data = response.json()
-        
-        if 'results' not in data or not data['results']:
-            print(f"❌ No data from Polygon.io for {ticker}")
-            return None
-        
-        df_data = []
-        for bar in data['results']:
-            df_data.append({
-                'timestamp': pd.to_datetime(bar['t'], unit='ms'),
-                'open': float(bar.get('o', 0)),
-                'high': float(bar.get('h', 0)),
-                'low': float(bar.get('l', 0)),
-                'close': float(bar.get('c', 0)),
-                'volume': float(bar.get('v', 0))
-            })
-        
-        if not df_data:
-            return None
-        
-        df = pd.DataFrame(df_data)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        print(f"✅ Fetched {len(df)} {timespan} candles from Polygon.io ({ticker})")
-        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-        
+            
+    except requests.exceptions.Timeout:
+        print(f"❌ DataSectors timeout for {symbol}")
+        return None
     except Exception as e:
-        print(f"❌ Polygon.io exception: {e}")
+        print(f"❌ DataSectors exception: {e}")
         return None
 
-def fetch_polygon_daily(symbol: str, limit: int = 1000) -> Optional[pd.DataFrame]:
-    """Fetch daily OHLC dari Polygon.io (Fallback)"""
+def fetch_datasectors_historical(symbol: str, to_date: str, timeframe: str = 'D', range_size: int = 100) -> Optional[pd.DataFrame]:
+    """
+    Fetch historical OHLCV data before a specific date
+    
+    Parameters:
+    - symbol: Trading pair (e.g., BINANCE:BTCUSDT)
+    - to_date: Fetch data before this date (YYYY-MM-DD)
+    - timeframe: D (day), W (week), M (month), or minutes
+    - range_size: Number of candles before the date
+    
+    Returns: DataFrame
+    """
     try:
-        rate_limit_check('polygon', min_interval=0.2)
-        
-        ticker = symbol.split('.')[0]
-        from_date = (pd.Timestamp.now() - pd.Timedelta(days=365*5)).strftime('%Y-%m-%d')  # 5 years
-        to_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-        
-        url = f"{POLYGON_BASE_URL}/bars/{ticker}"
-        
+        url = f"{DATASECTORS_BASE_URL}/api/chart/historical"
         params = {
-            'timespan': 'day',
-            'from': from_date,
-            'to': to_date,
-            'sort': 'asc',
-            'limit': limit,
-            'apiKey': POLYGON_API_KEY
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "to": to_date,
+            "range": min(range_size, 5000),
+            "timezone": "Asia/Jakarta"
         }
         
-        print(f"🔄 Fetching {ticker} daily from Polygon.io...")
-        response = requests.get(url, params=params, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"❌ Polygon.io HTTP {response.status_code}")
-            return None
-        
+        print(f"🔄 Fetching {symbol} historical data before {to_date}...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
         data = response.json()
         
-        if 'results' not in data or not data['results']:
-            print(f"❌ No daily data from Polygon.io")
-            return None
+        if data.get('success') and 'data' in data:
+            ohlcv_data = data['data']
+            
+            if not ohlcv_data:
+                return None
+            
+            df_data = []
+            for candle in ohlcv_data:
+                df_data.append({
+                    'timestamp': pd.to_datetime(candle.get('datetime', candle.get('time'))),
+                    'open': float(candle.get('open', 0)),
+                    'high': float(candle.get('high', 0)),
+                    'low': float(candle.get('low', 0)),
+                    'close': float(candle.get('close', 0)),
+                    'volume': float(candle.get('volume', 0))
+                })
+            
+            if df_data:
+                df = pd.DataFrame(df_data)
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                print(f"✅ Fetched {len(df)} historical candles")
+                return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
         
-        df_data = []
-        for bar in data['results']:
-            df_data.append({
-                'timestamp': pd.to_datetime(bar['t'], unit='ms'),
-                'open': float(bar.get('o', 0)),
-                'high': float(bar.get('h', 0)),
-                'low': float(bar.get('l', 0)),
-                'close': float(bar.get('c', 0)),
-                'volume': float(bar.get('v', 0))
-            })
-        
-        df = pd.DataFrame(df_data)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        print(f"✅ Fetched {len(df)} daily candles from Polygon.io ({ticker})")
-        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-        
-    except Exception as e:
-        print(f"❌ Polygon.io daily exception: {e}")
         return None
+            
+    except Exception as e:
+        print(f"❌ DataSectors historical error: {e}")
+        return None
+
+def fetch_datasectors_range(symbol: str, from_date: str, to_date: str, timeframe: str = 'D') -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV data within a date range
+    
+    Parameters:
+    - symbol: Trading pair
+    - from_date: Start date (YYYY-MM-DD)
+    - to_date: End date (YYYY-MM-DD)
+    - timeframe: Timeframe
+    
+    Returns: DataFrame
+    """
+    try:
+        url = f"{DATASECTORS_BASE_URL}/api/chart/range"
+        params = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "from": from_date,
+            "to": to_date,
+            "timezone": "Asia/Jakarta"
+        }
+        
+        print(f"🔄 Fetching {symbol} data from {from_date} to {to_date}...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('success') and 'data' in data:
+            ohlcv_data = data['data']
+            
+            if not ohlcv_data:
+                return None
+            
+            df_data = []
+            for candle in ohlcv_data:
+                df_data.append({
+                    'timestamp': pd.to_datetime(candle.get('datetime', candle.get('time'))),
+                    'open': float(candle.get('open', 0)),
+                    'high': float(candle.get('high', 0)),
+                    'low': float(candle.get('low', 0)),
+                    'close': float(candle.get('close', 0)),
+                    'volume': float(candle.get('volume', 0))
+                })
+            
+            if df_data:
+                df = pd.DataFrame(df_data)
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                print(f"✅ Fetched {len(df)} candles in date range")
+                return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        
+        return None
+            
+    except Exception as e:
+        print(f"❌ DataSectors range error: {e}")
+        return None
+
+def fetch_datasectors_custom_chart(symbol: str, chart_type: str = 'HeikinAshi', timeframe: str = 'D', range_size: int = 100) -> Optional[pd.DataFrame]:
+    """
+    Fetch custom chart type data (HeikinAshi, Renko, LineBreak, Kagi, PointAndFigure, Range)
+    """
+    try:
+        url = f"{DATASECTORS_BASE_URL}/api/chart/custom-type"
+        params = {
+            "symbol": symbol,
+            "type": chart_type,
+            "timeframe": timeframe,
+            "range": min(range_size, 5000),
+            "timezone": "Asia/Jakarta"
+        }
+        
+        print(f"🔄 Fetching {symbol} {chart_type} chart...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('success') and 'data' in data:
+            ohlcv_data = data['data']
+            
+            if not ohlcv_data:
+                return None
+            
+            df_data = []
+            for candle in ohlcv_data:
+                df_data.append({
+                    'timestamp': pd.to_datetime(candle.get('datetime', candle.get('time'))),
+                    'open': float(candle.get('open', 0)),
+                    'high': float(candle.get('high', 0)),
+                    'low': float(candle.get('low', 0)),
+                    'close': float(candle.get('close', 0)),
+                    'volume': float(candle.get('volume', 0))
+                })
+            
+            if df_data:
+                df = pd.DataFrame(df_data)
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                print(f"✅ Fetched {len(df)} {chart_type} candles")
+                return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        
+        return None
+            
+    except Exception as e:
+        print(f"❌ DataSectors custom chart error: {e}")
+        return None
+
+def get_datasectors_stock_info(symbol: str, market: str = 'id-id') -> dict:
+    """
+    Get stock information (Indonesia stocks)
+    
+    Parameters:
+    - symbol: Stock ticker (e.g., BBCA, TLKM)
+    - market: Market code (id-id for Indonesia, en-us for US)
+    
+    Returns: dict with company info
+    """
+    try:
+        url = f"{DATASECTORS_BASE_URL}/api/stocks/v2/search"
+        params = {
+            "symbol": symbol,
+            "market": market
+        }
+        
+        print(f"🔄 Fetching stock info for {symbol}...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('success'):
+            return {
+                'success': True,
+                'symbol': data.get('symbol'),
+                'secId': data.get('secId'),
+                'data': data.get('data')
+            }
+        else:
+            return {'success': False, 'error': 'Stock not found'}
+            
+    except Exception as e:
+        print(f"❌ DataSectors stock info error: {e}")
+        return {'success': False, 'error': str(e)}
+
+def get_datasectors_crypto_walls(symbol: str, limit: int = 100) -> dict:
+    """
+    Detect orderbook walls for cryptocurrency
+    
+    Parameters:
+    - symbol: Crypto symbol (e.g., BTCUSDT, ETHUSDT)
+    - limit: Orderbook depth (5, 10, 20, 50, 100, 500, 1000)
+    
+    Returns: dict with wall data
+    """
+    try:
+        url = f"{DATASECTORS_BASE_URL}/api/crypto/walls"
+        params = {
+            "symbol": symbol,
+            "limit": limit
+        }
+        
+        print(f"🔄 Fetching orderbook walls for {symbol}...")
+        response = requests.get(url, headers=DATASECTORS_HEADERS, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('success'):
+            return {
+                'success': True,
+                'symbol': symbol,
+                'data': data.get('data')
+            }
+        else:
+            return {'success': False, 'error': 'Failed to fetch walls'}
+            
+    except Exception as e:
+        print(f"❌ DataSectors crypto walls error: {e}")
+        return {'success': False, 'error': str(e)}
 
 def get_binance_klines(symbol: str, interval: str, limit: int = 1000) -> Optional[pd.DataFrame]:
     """
-    Fetch cryptocurrency OHLCV data from CryptoCompare API (Free, No Auth Required)
-    Used for crypto trading pairs like BTCUSDT, ETHUSDT, etc.
+    Fetch cryptocurrency OHLCV data from DataSectors API
     
     Parameters:
     - symbol: Trading pair (e.g., 'BTCUSDT', 'ETHUSDT')
     - interval: Timeframe ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w')
-    - limit: Number of candles to fetch (max 2000 from CryptoCompare)
+    - limit: Number of candles to fetch (max 5000 from DataSectors)
     
     Returns: DataFrame with columns [timestamp, open, high, low, close, volume]
     """
     
-    # Extract base asset from symbol (BTCUSDT -> BTC)
-    base_asset = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
-    
-    # Interval mapping untuk CryptoCompare API
+    # Interval mapping untuk DataSectors API
     interval_map = {
-        "1m": ("histominute", 1),
-        "5m": ("histominute", 5),
-        "15m": ("histominute", 15),
-        "30m": ("histominute", 30),
-        "1h": ("histohour", 1),
-        "4h": ("histohour", 4),
-        "1d": ("histoday", 1),
-        "1w": ("histoday", 7)
+        "1m": "1",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "1h": "60",
+        "4h": "240",
+        "1d": "D",
+        "1w": "W"
     }
     
-    endpoint, aggregate = interval_map.get(interval, ("histohour", 1))
+    ds_interval = interval_map.get(interval, "D")
     
+    # Fetch from DataSectors API (Primary only)
     try:
-        # CryptoCompare API (Free, No API Key Required!)
-        url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}"
-        params = {
-            "fsym": base_asset,
-            "tsym": "USD",
-            "limit": min(limit, 2000),  # CryptoCompare max is 2000
-            "aggregate": aggregate
-        }
+        # Build symbol in format EXCHANGE:SYMBOL
+        # For crypto, use BINANCE exchange
+        ds_symbol = f"BINANCE:{symbol.upper()}"
         
-        print(f"🔄 Fetching {base_asset} {interval} from CryptoCompare...")
-        response = requests.get(url, params=params, timeout=15)
+        df = fetch_datasectors_ohlcv(ds_symbol, ds_interval, min(limit, 5000))
         
-        if response.status_code == 200:
-            result = response.json()
-            
-            if result.get('Response') == 'Success' and 'Data' in result and 'Data' in result['Data']:
-                data = result['Data']['Data']
-                
-                df_data = []
-                for candle in data:
-                    df_data.append({
-                        'timestamp': pd.to_datetime(candle['time'], unit='s'),
-                        'open': float(candle['open']),
-                        'high': float(candle['high']),
-                        'low': float(candle['low']),
-                        'close': float(candle['close']),
-                        'volume': float(candle['volumeto'])  # Volume in quote currency
-                    })
-                
-                if df_data:
-                    df = pd.DataFrame(df_data)
-                    df = df.sort_values('timestamp').reset_index(drop=True)
-                    
-                    print(f"✅ Fetched {len(df)} {interval} candles from CryptoCompare ({base_asset})")
-                    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-            else:
-                error_msg = result.get('Message', 'Unknown error')
-                print(f"❌ CryptoCompare API error: {error_msg}")
-                return None
-        
-        elif response.status_code == 429:
-            print(f"⚠️ CryptoCompare rate limit hit - waiting...")
-            time.sleep(5)
-            return None
+        if df is not None and len(df) > 0:
+            print(f"✅ Successfully fetched {symbol} from DataSectors")
+            return df
         else:
-            print(f"❌ CryptoCompare HTTP error: {response.status_code}")
+            print(f"❌ No data returned from DataSectors for {symbol}")
             return None
             
-    except requests.exceptions.Timeout:
-        print(f"❌ CryptoCompare timeout")
-        return None
     except Exception as e:
-        print(f"❌ CryptoCompare exception: {e}")
+        print(f"❌ Error fetching {symbol} from DataSectors: {e}")
         return None
 
 def fetch_stock_data_yfinance(symbol: str, interval: str = '1d', limit: int = 1000) -> Optional[pd.DataFrame]:
@@ -808,111 +837,149 @@ def fetch_stock_data_yfinance(symbol: str, interval: str = '1d', limit: int = 10
 
 def fetch_stock_data(symbol: str, interval: str = '1d', limit: int = 1000) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLC data dengan triple fallback logic:
-    1. Coba Alpha Vantage (memerlukan valid API key)
-    2. Jika gagal → Polygon.io (memerlukan valid API key)
-    3. Jika gagal → yfinance (GRATIS, no API key needed) ✅
-    4. Jika semua gagal → Return None
+    Fetch stock OHLC data dengan dual source:
+    1. Coba DataSectors API (XIDX untuk Indonesia stocks)
+    2. Jika gagal → yfinance (GRATIS, no API key needed) ✅
     """
     print(f"📊 Fetching {symbol} with interval {interval}...")
     
-    # Determine jika daily atau intraday
-    is_daily = interval in ['1d', 'daily']
+    # Format symbol untuk DataSectors (XIDX:TICKER)
+    ds_symbol = f"XIDX:{symbol.upper()}"
     
-    if is_daily:
-        # Daily: coba Alpha Vantage terlebih dahulu
-        df = fetch_alpha_vantage_daily(symbol, limit)
+    # Interval mapping untuk DataSectors
+    interval_map = {
+        '1m': '1',
+        '5m': '5',
+        '15m': '15',
+        '30m': '30',
+        '1h': '60',
+        '4h': '240',
+        '1d': 'D',
+        '1w': 'W'
+    }
+    
+    ds_interval = interval_map.get(interval, 'D')
+    
+    # Try DataSectors API first
+    try:
+        df = fetch_datasectors_ohlcv(ds_symbol, ds_interval, min(limit, 5000))
         if df is not None and len(df) > 0:
+            print(f"✅ Fetched {symbol} from DataSectors API")
             return df
-        
-        # Fallback ke Polygon.io
-        print(f"⚠️ Alpha Vantage failed, trying Polygon.io...")
-        df = fetch_polygon_daily(symbol, limit)
-        if df is not None and len(df) > 0:
-            return df
-        
-        # Last fallback: yfinance (GRATIS, reliable)
-        print(f"⚠️ Polygon.io failed, trying yfinance (free)...")
-        df = fetch_stock_data_yfinance(symbol, interval, limit)
-        if df is not None and len(df) > 0:
-            return df
-    else:
-        # Intraday: coba Alpha Vantage terlebih dahulu
-        df = fetch_alpha_vantage_intraday(symbol, interval, limit)
-        if df is not None and len(df) > 0:
-            return df
-        
-        # Fallback ke Polygon.io
-        print(f"⚠️ Alpha Vantage failed, trying Polygon.io...")
-        df = fetch_polygon_intraday(symbol, interval, limit)
-        if df is not None and len(df) > 0:
-            return df
-        
-        # Last fallback: yfinance
-        print(f"⚠️ Polygon.io failed, trying yfinance (free)...")
-        df = fetch_stock_data_yfinance(symbol, interval, limit)
-        if df is not None and len(df) > 0:
-            return df
+    except Exception as e:
+        print(f"⚠️ DataSectors fetch failed: {e}, trying fallback...")
+    
+    # Fallback to yfinance (GRATIS, reliable)
+    print(f"⚠️ Trying yfinance (free fallback)...")
+    df = fetch_stock_data_yfinance(symbol, interval, limit)
+    if df is not None and len(df) > 0:
+        return df
     
     print(f"❌ Failed to fetch data for {symbol} from all APIs")
     return None
 
+
 def get_available_symbols():
-    """Get popular cryptocurrencies (predefined list)"""
+    """
+    Get available cryptocurrencies dari DataSectors API
+    Fetch symbols dynamically dari BINANCE exchange
+    NO fallback - all data from API only
+    """
     
-    # Top 100+ cryptocurrencies by market cap
-    popular_coins = [
-        "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT", "MATIC",
-        "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM", "ALGO", "VET", "ICP", "FIL",
-        "TRX", "NEAR", "APT", "ARB", "OP", "SHIB", "DAI", "WBTC", "TON", "BCH",
-        "LEO", "OKB", "HBAR", "QNT", "CRO", "LDO", "MNT", "IMX", "AAVE", "GRT",
-        "INJ", "MKR", "RUNE", "STX", "SNX", "FTM", "SAND", "MANA", "AXS", "CHZ",
-        "THETA", "EOS", "FLOW", "EGLD", "XTZ", "BSV", "KAVA", "ZEC", "DASH",
-        "WAVES", "NEO", "IOTA", "KCS", "BAT", "ZIL", "ENJ", "COMP", "YFI",
-        "UMA", "ZRX", "BAL", "CRV", "SUSHI", "1INCH", "LUNA", "FTT"
+    # Top popular cryptocurrencies untuk di-search dari DataSectors
+    search_terms = [
+        "bitcoin", "ethereum", "binance coin", "solana", "ripple",
+        "cardano", "dogecoin", "avalanche", "polkadot", "polygon",
+        "chainlink", "uniswap", "cosmos", "litecoin", "ethereum classic",
+        "stellar", "algorand", "vechain", "internet computer", "filecoin",
+        "tron", "near protocol", "aptos", "arbitrum", "optimism",
+        "shiba inu", "dai stablecoin", "wrapped bitcoin", "toncoin", "bitcoin cash"
     ]
     
     symbols = []
-    for coin in popular_coins:
-        symbols.append({
-            "symbol": f"{coin}USDT",
-            "exchange": "CryptoCompare",
-            "status": "TRADING",
-            "baseAsset": coin,
-            "quoteAsset": "USDT",
-            "name": coin
-        })
     
-    print(f"✅ Loaded {len(symbols)} popular cryptocurrencies")
-    return symbols
+    # Fetch SEMUA symbols dari DataSectors API
+    for search_term in search_terms:
+        try:
+            # Search di DataSectors untuk setiap cryptocurrency
+            result = search_datasectors_symbol(search_term)
+            
+            if result.get('success') and result.get('data'):
+                # Filter hasil untuk BINANCE:SYMBOL format
+                for item in result['data']:
+                    # Cek apakah symbol dimulai dengan BINANCE
+                    if isinstance(item, dict):
+                        symbol = item.get('symbol', '')
+                    else:
+                        symbol = str(item)
+                    
+                    # Hanya terima BINANCE format
+                    if symbol.startswith('BINANCE:') and 'USDT' in symbol:
+                        clean_symbol = symbol.replace('BINANCE:', '')
+                        
+                        symbols.append({
+                            "symbol": clean_symbol,
+                            "symbol_full": symbol,
+                            "exchange": "BINANCE",
+                            "source": "DataSectors",
+                            "status": "TRADING",
+                            "baseAsset": clean_symbol.replace('USDT', ''),
+                            "quoteAsset": "USDT",
+                            "name": search_term.title()
+                        })
+                        break  # Ambil yang pertama saja per search term
+        
+        except Exception as e:
+            print(f"❌ Error searching {search_term}: {e}")
+            # TIDAK ADA fallback - skip jika error
+            continue
+    
+    # Remove duplicates
+    seen = set()
+    unique_symbols = []
+    for sym in symbols:
+        symbol_key = sym['symbol']
+        if symbol_key not in seen:
+            seen.add(symbol_key)
+            unique_symbols.append(sym)
+    
+    print(f"✅ Loaded {len(unique_symbols)} cryptocurrencies dari DataSectors API")
+    
+    if len(unique_symbols) == 0:
+        print("❌ WARNING: No symbols fetched from DataSectors API!")
+    
+    return unique_symbols
+
 
 def get_symbol_info(symbol: str):
-    """Get current price info from CryptoCompare"""
+    """Get cryptocurrency symbol info from DataSectors API"""
     
-    base_asset = symbol.replace("USDT", "").replace("BUSD", "")
+    # Extract base asset from symbol (BTCUSDT -> BTC)
+    base_asset = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
     
     try:
-        url = "https://min-api.cryptocompare.com/data/pricemultifull"
-        params = {
-            "fsyms": base_asset,
-            "tsyms": "USD"
-        }
+        # Search symbol dalam DataSectors
+        result = search_datasectors_symbol(base_asset)
         
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if 'RAW' in data and base_asset in data['RAW'] and 'USD' in data['RAW'][base_asset]:
-                info = data['RAW'][base_asset]['USD']
-                return {
-                    "symbol": symbol,
-                    "price": info.get('PRICE'),
-                    "change_24h": info.get('CHANGEPCT24HOUR'),
-                    "volume_24h": info.get('VOLUME24HOURTO'),
-                    "source": "CryptoCompare"
-                }
+        if result.get('success') and result.get('data'):
+            # Cari BINANCE format
+            for item in result['data']:
+                if isinstance(item, dict):
+                    item_symbol = item.get('symbol', '')
+                else:
+                    item_symbol = str(item)
+                
+                if item_symbol.startswith('BINANCE:') and 'USDT' in item_symbol:
+                    return {
+                        "symbol": symbol,
+                        "symbol_full": item_symbol,
+                        "exchange": "BINANCE",
+                        "baseAsset": base_asset,
+                        "quoteAsset": "USDT",
+                        "source": "DataSectors"
+                    }
     except Exception as e:
-        print(f"❌ CryptoCompare price error: {e}")
+        print(f"❌ DataSectors symbol info error: {e}")
     
     return None
 
@@ -1729,23 +1796,102 @@ async def get_symbols(
     limit: Optional[int] = 500,
     payload: dict = Depends(verify_token)
 ):
-    symbols_list = get_available_symbols()
+    """Search for symbols using DataSectors API. If no search provided, return cached popular cryptocurrencies."""
+    global POPULAR_SYMBOLS_CACHE
     
     if search:
-        symbols_list = [s for s in symbols_list if search.upper() in s['symbol']]
+        # Specific search provided - use cached function
+        result = search_datasectors_symbol(search)
+        if result.get('success'):
+            return {
+                "symbols": result.get('data', [])[:limit],
+                "total": result.get('count', 0),
+                "source": "DataSectors"
+            }
+        else:
+            raise HTTPException(status_code=400, detail=f"Search failed: {result.get('error')}")
     
-    return {
-        "symbols": symbols_list[:limit], 
-        "total": len(symbols_list),
-        "exchanges": list(set([s['exchange'] for s in symbols_list[:limit]]))
-    }
+    # If no search, return popular cryptocurrencies from cache
+    current_time = time.time()
+    
+    # Check if cache is still valid
+    if (POPULAR_SYMBOLS_CACHE['data'] and 
+        current_time - POPULAR_SYMBOLS_CACHE['timestamp'] < POPULAR_SYMBOLS_CACHE['ttl']):
+        print("✓ Using cached popular symbols")
+        return {
+            "symbols": POPULAR_SYMBOLS_CACHE['data'][:limit],
+            "total": len(POPULAR_SYMBOLS_CACHE['data']),
+            "source": "DataSectors (Cached)"
+        }
+    
+    # If cache expired, rebuild it with single smart search
+    print("🔄 Rebuilding popular symbols cache...")
+    try:
+        # Use a single broad search to get top cryptocurrencies
+        # This is much more efficient than 10 separate API calls
+        result = search_datasectors_symbol("crypto")
+        
+        if result.get('success'):
+            all_symbols = result.get('data', [])
+            
+            # Cache the result
+            POPULAR_SYMBOLS_CACHE['data'] = all_symbols
+            POPULAR_SYMBOLS_CACHE['timestamp'] = current_time
+            
+            return {
+                "symbols": all_symbols[:limit],
+                "total": len(all_symbols),
+                "source": "DataSectors"
+            }
+        else:
+            # Fallback: return cached data even if expired
+            if POPULAR_SYMBOLS_CACHE['data']:
+                return {
+                    "symbols": POPULAR_SYMBOLS_CACHE['data'][:limit],
+                    "total": len(POPULAR_SYMBOLS_CACHE['data']),
+                    "source": "DataSectors (Stale Cache)"
+                }
+            else:
+                raise HTTPException(status_code=503, detail="Could not fetch symbols. Please try again.")
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"❌ Error rebuilding symbols cache: {e}")
+        # Fallback to cached data if available
+        if POPULAR_SYMBOLS_CACHE['data']:
+            return {
+                "symbols": POPULAR_SYMBOLS_CACHE['data'][:limit],
+                "total": len(POPULAR_SYMBOLS_CACHE['data']),
+                "source": "DataSectors (Stale Cache)"
+            }
+        else:
+            raise HTTPException(status_code=503, detail="Could not fetch symbols. Please try again.")
 
 @app.get("/api/symbols/{symbol}/info")
 async def get_symbol_details(symbol: str, payload: dict = Depends(verify_token)):
-    info = get_symbol_info(symbol)
-    if info:
-        return info
-    raise HTTPException(status_code=404, detail="Symbol not found")
+    """Get symbol details from DataSectors"""
+    # Try stock info first
+    stock_result = get_datasectors_stock_info(symbol)
+    if stock_result.get('success'):
+        return {
+            "symbol": symbol,
+            "type": "stock",
+            "data": stock_result.get('data'),
+            "source": "DataSectors"
+        }
+    
+    # Try crypto search
+    crypto_result = search_datasectors_symbol(symbol)
+    if crypto_result.get('success') and crypto_result.get('count', 0) > 0:
+        return {
+            "symbol": symbol,
+            "type": "crypto",
+            "data": crypto_result.get('data', []),
+            "source": "DataSectors"
+        }
+    
+    raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
 
 @app.post("/api/scan")
 async def scan_ticker(request: ScanRequest, payload: dict = Depends(verify_token)):
@@ -2336,28 +2482,78 @@ async def close_trade(
 # INDONESIA STOCKS ENDPOINTS
 # ============================================================
 
-# Daftar saham Indonesia yang tersedia
-INDONESIA_STOCKS = {
-    'BBCA': {'name': 'Bank Central Asia', 'sector': 'Banking'},
-    'BBRI': {'name': 'Bank Rakyat Indonesia', 'sector': 'Banking'},
-    'BMRI': {'name': 'Bank Mandiri', 'sector': 'Banking'},
-    'BBNI': {'name': 'Bank Negara Indonesia', 'sector': 'Banking'},
-    'ASII': {'name': 'Astra International', 'sector': 'Automotive'},
-    'TLKM': {'name': 'Telekomunikasi Indonesia', 'sector': 'Telecom'},
-    'UNVR': {'name': 'Unilever Indonesia', 'sector': 'Consumer Goods'},
-    'INDF': {'name': 'Indofood', 'sector': 'Food & Beverage'},
-    'ICBP': {'name': 'Indofood CBP', 'sector': 'Food & Beverage'},
-    'SMGR': {'name': 'Semen Gresik', 'sector': 'Construction Materials'},
-    'INTP': {'name': 'Indocement', 'sector': 'Construction Materials'},
-    'PGAS': {'name': 'Perusahaan Gas Negara', 'sector': 'Energy'},
-    'LPKR': {'name': 'Lippo Karawaci', 'sector': 'Real Estate'},
-    'MNCN': {'name': 'Media Nusantara Citra', 'sector': 'Media'},
-    'JSMR': {'name': 'Jasa Marga', 'sector': 'Infrastructure'},
-    'ADRO': {'name': 'Adaro Energy', 'sector': 'Energy'},
-    'ITMG': {'name': 'Indo Tambangraya Megah', 'sector': 'Mining'},
-    'GSMF': {'name': 'Gajah Tunggal', 'sector': 'Automotive'},
-    'CPRO': {'name': 'Central Protein Prime', 'sector': 'Food & Beverage'},
-}
+def get_indonesia_stocks():
+    """
+    Fetch daftar saham Indonesia dari DataSectors API dengan smart caching
+    Uses single broad search instead of 19 individual searches
+    NO fallback - all data from API only
+    
+    Returns:
+    - Dictionary dengan ticker sebagai key dan info stock sebagai value
+    """
+    global INDONESIA_STOCKS_CACHE
+    
+    current_time = time.time()
+    
+    # Check if cache is still valid
+    if (INDONESIA_STOCKS_CACHE['data'] and 
+        current_time - INDONESIA_STOCKS_CACHE['timestamp'] < INDONESIA_STOCKS_CACHE['ttl']):
+        print("✓ Using cached Indonesia stocks")
+        return INDONESIA_STOCKS_CACHE['data']
+    
+    print("🔄 Rebuilding Indonesia stocks cache...")
+    
+    try:
+        # Use single smart search for all Indonesia stocks
+        # DataSectors will return XIDX market stocks
+        result = search_datasectors_symbol("XIDX")
+        
+        stocks = {}
+        
+        if result.get('success') and result.get('data'):
+            # Process all returned stocks
+            for item in result['data']:
+                if isinstance(item, dict):
+                    symbol = item.get('symbol', '')
+                    name = item.get('name', '')
+                else:
+                    symbol = str(item)
+                    name = str(item)
+                
+                # Filter untuk XIDX:SYMBOL format
+                if symbol.startswith('XIDX:'):
+                    ticker = symbol.replace('XIDX:', '')
+                    
+                    # Hanya simpan jika belum ada (avoid duplicates)
+                    if ticker not in stocks:
+                        stocks[ticker] = {
+                            'name': name or ticker,
+                            'symbol': symbol,
+                            'exchange': 'XIDX',
+                            'market': 'Indonesia'
+                        }
+        
+        # Cache the result
+        INDONESIA_STOCKS_CACHE['data'] = stocks
+        INDONESIA_STOCKS_CACHE['timestamp'] = current_time
+        
+        print(f"✅ Loaded {len(stocks)} Indonesia stocks dari DataSectors API")
+        
+        return stocks
+    
+    except Exception as e:
+        print(f"❌ Error fetching Indonesia stocks: {e}")
+        
+        # Return cached data even if expired (graceful fallback)
+        if INDONESIA_STOCKS_CACHE['data']:
+            print("⚠️ Using stale cached Indonesia stocks")
+            return INDONESIA_STOCKS_CACHE['data']
+        else:
+            print("❌ WARNING: No Indonesia stocks available!")
+            return {}
+
+# Cache untuk Indonesia stocks (diupdate saat startup)
+INDONESIA_STOCKS = get_indonesia_stocks()
 
 def fetch_indonesia_stock_data(ticker: str, interval: str = '1d') -> Dict:
     """
@@ -2654,36 +2850,169 @@ async def analyze_indonesia_stock_endpoint(
     ticker: str,
     interval: str = '1d'
 ):
-    """Analyze Indonesia stock using Alpha Vantage API"""
+    """Analyze Indonesia stock using DataSectors API (Updated)"""
     if ticker.upper() not in INDONESIA_STOCKS:
         raise HTTPException(status_code=404, detail=f"Stock {ticker} not found. Supported: {', '.join(INDONESIA_STOCKS.keys())}")
     
-    result = analyze_indonesia_stock(ticker, interval)
+    # Use DataSectors API instead of Alpha Vantage
+    symbol = f"XIDX:{ticker.upper()}"
     
-    if 'error' in result:
-        raise HTTPException(status_code=400, detail=result['error'])
+    # Map interval to DataSectors format
+    interval_map = {
+        '1m': '1',
+        '5m': '5',
+        '15m': '15',
+        '30m': '30',
+        '1h': '60',
+        '4h': '240',
+        '1d': 'D',
+        '1w': 'W',
+        'daily': 'D',
+        'weekly': 'W'
+    }
     
-    return result
+    ds_interval = interval_map.get(interval, 'D')
+    
+    # Fetch from DataSectors
+    df = fetch_datasectors_ohlcv(symbol, ds_interval, 1000)
+    
+    if df is None or len(df) < 50:
+        raise HTTPException(status_code=400, detail="Unable to fetch sufficient data from DataSectors")
+    
+    try:
+        # Perform technical analysis
+        df, smc_data = perform_full_analysis(df)
+        
+        # Get stock info
+        stock_info = get_datasectors_stock_info(ticker.upper(), 'id-id')
+        
+        supports, resistances = find_support_resistance(df)
+        fib_levels = calculate_fibonacci_levels(df)
+        trend = detect_trendline(df)
+        volume_status, volume_strength = analyze_volume(df)
+        signal, confidence, bull_signals, bear_signals = generate_signal(df, smc_data)
+        patterns = detect_all_patterns(df)
+        
+        current_price = float(df['close'].iloc[-1])
+        
+        result = {
+            "symbol": ticker.upper(),
+            "ticker": ticker.upper(),
+            "name": INDONESIA_STOCKS.get(ticker.upper(), {}).get('name', 'Unknown'),
+            "sector": INDONESIA_STOCKS.get(ticker.upper(), {}).get('sector', 'Unknown'),
+            "exchange": "XIDX",
+            "currency": "IDR",
+            "interval": interval,
+            "source": "DataSectors",
+            "current_price": current_price,
+            "signal": signal,
+            "confidence": round(confidence, 2),
+            "bullish_signals": bull_signals,
+            "bearish_signals": bear_signals,
+            "trend": trend,
+            "total_candles": len(df),
+            "moving_averages": {
+                "MA12": safe_float(df['MA12'].iloc[-1]),
+                "MA26": safe_float(df['MA26'].iloc[-1]),
+                "MA50": safe_float(df['MA50'].iloc[-1]),
+                "MA200": safe_float(df['MA200'].iloc[-1]),
+                "EMA9": safe_float(df['EMA9'].iloc[-1]),
+                "EMA21": safe_float(df['EMA21'].iloc[-1])
+            },
+            "rsi": safe_float(df['RSI'].iloc[-1]),
+            "macd": {
+                "macd": safe_float(df['MACD'].iloc[-1]),
+                "signal": safe_float(df['MACD_signal'].iloc[-1]),
+                "histogram": safe_float(df['MACD_hist'].iloc[-1])
+            },
+            "stochastic": {
+                "k": safe_float(df['STOCH_K'].iloc[-1]),
+                "d": safe_float(df['STOCH_D'].iloc[-1])
+            },
+            "atr": safe_float(df['ATR'].iloc[-1]),
+            "bollinger_bands": {
+                "upper": safe_float(df['BB_upper'].iloc[-1]),
+                "middle": safe_float(df['BB_middle'].iloc[-1]),
+                "lower": safe_float(df['BB_lower'].iloc[-1])
+            },
+            "support_levels": [float(s) for s in supports],
+            "resistance_levels": [float(r) for r in resistances],
+            "fibonacci": {k: float(v) for k, v in fib_levels.items()},
+            "volume": {
+                "status": volume_status,
+                "strength": volume_strength,
+                "obv": safe_float(df['OBV'].iloc[-1])
+            },
+            "patterns": patterns,
+            "stock_info": stock_info.get('data') if stock_info.get('success') else None
+        }
+        
+        return result
+    except Exception as e:
+        print(f"Analysis error: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 @app.get("/api/stocks/indonesia/{ticker}/data")
 async def get_indonesia_stock_data_endpoint(
     ticker: str,
     interval: str = '1d'
 ):
-    """Get Indonesia stock OHLCV data using Alpha Vantage + Polygon.io Fallback"""
+    """Get Indonesia stock OHLCV data using DataSectors API (Updated)"""
     if ticker.upper() not in INDONESIA_STOCKS:
         raise HTTPException(status_code=404, detail=f"Stock {ticker} not found")
     
-    result = fetch_indonesia_stock_data(ticker, interval)
+    symbol = f"XIDX:{ticker.upper()}"
     
-    if 'error' in result:
-        raise HTTPException(status_code=400, detail=result['error'])
+    # Map interval to DataSectors format
+    interval_map = {
+        '1m': '1',
+        '5m': '5',
+        '15m': '15',
+        '30m': '30',
+        '1h': '60',
+        '4h': '240',
+        '1d': 'D',
+        '1w': 'W',
+        'daily': 'D',
+        'weekly': 'W'
+    }
     
-    return result
+    ds_interval = interval_map.get(interval, 'D')
+    
+    # Fetch from DataSectors
+    df = fetch_datasectors_ohlcv(symbol, ds_interval, 1000)
+    
+    if df is None or len(df) == 0:
+        raise HTTPException(status_code=404, detail=f"No data available for {ticker}")
+    
+    # Convert to response format
+    chart_data = []
+    for _, row in df.iterrows():
+        chart_data.append({
+            'timestamp': row['timestamp'].isoformat(),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close']),
+            'volume': float(row['volume'])
+        })
+    
+    return {
+        'ticker': ticker.upper(),
+        'symbol': f"{ticker.upper()}.JK",
+        'name': INDONESIA_STOCKS.get(ticker.upper(), {}).get('name', 'Unknown'),
+        'sector': INDONESIA_STOCKS.get(ticker.upper(), {}).get('sector', 'Unknown'),
+        'exchange': 'XIDX',
+        'currency': 'IDR',
+        'interval': interval,
+        'source': 'DataSectors',
+        'data': chart_data,
+        'count': len(chart_data)
+    }
 
 @app.get("/api/crypto/summary")
 async def get_crypto_summary():
-    """Get current prices for BTC, ETH, SOL and Fear & Greed Index"""
+    """Get current prices for BTC, ETH, SOL from DataSectors API"""
     try:
         result = {
             "prices": {},
@@ -2691,30 +3020,24 @@ async def get_crypto_summary():
             "timestamp": datetime.now().isoformat()
         }
         
-        # Fetch current prices from CryptoCompare
-        url = "https://min-api.cryptocompare.com/data/pricemultifull"
-        
-        for symbol in ['BTC', 'ETH', 'SOL']:
+        # Fetch current prices from DataSectors API
+        for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:
             try:
-                params = {
-                    "fsyms": symbol,
-                    "tsyms": "USD"
-                }
-                response = requests.get(url, params=params, timeout=5)
-                response.raise_for_status()
-                data = response.json()
+                # Get 1-day OHLCV data to get latest price
+                df = get_binance_klines(symbol, '1d', limit=1)
                 
-                if 'DISPLAY' in data and symbol in data['DISPLAY']:
-                    price_data = data['DISPLAY'][symbol]['USD']
-                    result['prices'][symbol] = {
-                        "price": float(price_data['PRICE'].replace('$', '').replace(',', '')),
-                        "change_24h": price_data.get('CHANGE24H', 'N/A'),
-                        "change_pct_24h": price_data.get('CHANGEPCT24H', 'N/A'),
-                        "market_cap": price_data.get('MKTCAP', 'N/A')
+                if df is not None and len(df) > 0:
+                    latest_close = float(df['close'].iloc[-1])
+                    base_symbol = symbol.replace('USDT', '')
+                    result['prices'][base_symbol] = {
+                        "price": latest_close,
+                        "symbol_full": f"BINANCE:{symbol}",
+                        "source": "DataSectors"
                     }
             except Exception as e:
-                print(f"Error fetching {symbol} price: {str(e)}")
-                result['prices'][symbol] = {"error": str(e)}
+                print(f"Error fetching {symbol} price from DataSectors: {str(e)}")
+                base_symbol = symbol.replace('USDT', '')
+                result['prices'][base_symbol] = {"error": str(e)}
         
         # Fetch Fear & Greed Index
         try:
@@ -2856,6 +3179,406 @@ async def delete_conversation(conversation_id: str, token_data = Depends(verify_
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+# ===== DataSectors API Endpoints =====
+
+@app.get("/api/datasectors/search")
+async def search_symbols(query: str, payload: dict = Depends(verify_token)):
+    """Search for trading symbols (stocks, crypto, forex) using DataSectors API"""
+    if not query or len(query) < 1:
+        raise HTTPException(status_code=400, detail="Query parameter required")
+    
+    result = search_datasectors_symbol(query)
+    return {
+        "query": query,
+        "success": result.get('success'),
+        "data": result.get('data', []),
+        "count": result.get('count', 0),
+        "source": "DataSectors"
+    }
+
+@app.get("/api/datasectors/chart/ohlcv")
+async def get_chart_ohlcv(
+    symbol: str,
+    timeframe: str = 'D',
+    range_size: int = 100,
+    payload: dict = Depends(verify_token)
+):
+    """
+    Fetch OHLCV data from DataSectors
+    Symbol format: EXCHANGE:SYMBOL (e.g., BINANCE:BTCUSDT, XIDX:BBCA)
+    Timeframe: 1-45 (min), 60 (1h), 120 (2h), 180 (3h), 240 (4h), D, W, M
+    """
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol required")
+    
+    df = fetch_datasectors_ohlcv(symbol, timeframe, range_size)
+    
+    if df is None or len(df) == 0:
+        raise HTTPException(status_code=404, detail=f"No data for {symbol}")
+    
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "count": len(df),
+        "data": df.to_dict('records'),
+        "source": "DataSectors"
+    }
+
+@app.get("/api/datasectors/chart/historical")
+async def get_chart_historical(
+    symbol: str,
+    to_date: str,
+    timeframe: str = 'D',
+    range_size: int = 100,
+    payload: dict = Depends(verify_token)
+):
+    """
+    Fetch historical OHLCV data before a specific date
+    to_date format: YYYY-MM-DD
+    """
+    if not symbol or not to_date:
+        raise HTTPException(status_code=400, detail="Symbol and to_date required")
+    
+    df = fetch_datasectors_historical(symbol, to_date, timeframe, range_size)
+    
+    if df is None or len(df) == 0:
+        raise HTTPException(status_code=404, detail=f"No historical data for {symbol}")
+    
+    return {
+        "symbol": symbol,
+        "to_date": to_date,
+        "timeframe": timeframe,
+        "count": len(df),
+        "data": df.to_dict('records'),
+        "source": "DataSectors"
+    }
+
+@app.get("/api/datasectors/chart/range")
+async def get_chart_range(
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    timeframe: str = 'D',
+    payload: dict = Depends(verify_token)
+):
+    """
+    Fetch OHLCV data within a date range
+    Date format: YYYY-MM-DD
+    """
+    if not symbol or not from_date or not to_date:
+        raise HTTPException(status_code=400, detail="Symbol, from_date and to_date required")
+    
+    df = fetch_datasectors_range(symbol, from_date, to_date, timeframe)
+    
+    if df is None or len(df) == 0:
+        raise HTTPException(status_code=404, detail=f"No data in range for {symbol}")
+    
+    return {
+        "symbol": symbol,
+        "from_date": from_date,
+        "to_date": to_date,
+        "timeframe": timeframe,
+        "count": len(df),
+        "data": df.to_dict('records'),
+        "source": "DataSectors"
+    }
+
+@app.get("/api/datasectors/chart/custom-type")
+async def get_chart_custom_type(
+    symbol: str,
+    chart_type: str = 'HeikinAshi',
+    timeframe: str = 'D',
+    range_size: int = 100,
+    payload: dict = Depends(verify_token)
+):
+    """
+    Fetch custom chart type data
+    chart_type: HeikinAshi, Renko, LineBreak, Kagi, PointAndFigure, Range
+    """
+    valid_types = ['HeikinAshi', 'Renko', 'LineBreak', 'Kagi', 'PointAndFigure', 'Range']
+    if chart_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid chart_type. Must be one of: {', '.join(valid_types)}")
+    
+    df = fetch_datasectors_custom_chart(symbol, chart_type, timeframe, range_size)
+    
+    if df is None or len(df) == 0:
+        raise HTTPException(status_code=404, detail=f"No {chart_type} data for {symbol}")
+    
+    return {
+        "symbol": symbol,
+        "chart_type": chart_type,
+        "timeframe": timeframe,
+        "count": len(df),
+        "data": df.to_dict('records'),
+        "source": "DataSectors"
+    }
+
+@app.get("/api/datasectors/stocks/search")
+async def search_stock(symbol: str, market: str = 'id-id', payload: dict = Depends(verify_token)):
+    """
+    Search for stock information (Indonesia stocks)
+    symbol: Stock ticker (e.g., BBCA, TLKM, GGRM)
+    market: Market code (id-id for Indonesia, en-us for US)
+    """
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol required")
+    
+    result = get_datasectors_stock_info(symbol, market)
+    
+    if result.get('success'):
+        return {
+            "symbol": result.get('symbol'),
+            "secId": result.get('secId'),
+            "market": market,
+            "data": result.get('data'),
+            "source": "DataSectors"
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"Stock {symbol} not found: {result.get('error')}")
+
+@app.get("/api/datasectors/crypto/walls")
+async def get_crypto_walls(
+    symbol: str,
+    limit: int = 100,
+    payload: dict = Depends(verify_token)
+):
+    """
+    Detect orderbook walls for cryptocurrency
+    symbol: Crypto symbol (e.g., BTCUSDT, ETHUSDT)
+    limit: Orderbook depth (5, 10, 20, 50, 100, 500, 1000)
+    """
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol required")
+    
+    valid_limits = [5, 10, 20, 50, 100, 500, 1000]
+    if limit not in valid_limits:
+        raise HTTPException(status_code=400, detail=f"Invalid limit. Must be one of: {', '.join(map(str, valid_limits))}")
+    
+    result = get_datasectors_crypto_walls(symbol, limit)
+    
+    if result.get('success'):
+        return {
+            "symbol": symbol,
+            "limit": limit,
+            "data": result.get('data'),
+            "source": "DataSectors"
+        }
+    else:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch walls: {result.get('error')}")
+
+@app.post("/api/datasectors/scan/crypto")
+async def scan_crypto_datasectors(
+    symbol: str,
+    timeframe: str = 'D',
+    payload: dict = Depends(verify_token)
+):
+    """
+    Scan cryptocurrency using DataSectors API
+    Combines chart data with order book walls analysis
+    """
+    try:
+        # Format symbol for DataSectors (BINANCE:BTCUSDT)
+        ds_symbol = f"BINANCE:{symbol.upper()}"
+        
+        # Fetch OHLCV data
+        df = fetch_datasectors_ohlcv(ds_symbol, timeframe, 1000)
+        
+        if df is None or len(df) < 50:
+            raise HTTPException(status_code=400, detail="Insufficient data for analysis")
+        
+        # Perform technical analysis
+        df, smc_data = perform_full_analysis(df)
+        
+        # Get orderbook walls
+        walls_result = get_datasectors_crypto_walls(symbol, limit=100)
+        walls_data = walls_result.get('data', {}) if walls_result.get('success') else {}
+        
+        # Generate signals
+        supports, resistances = find_support_resistance(df)
+        fib_levels = calculate_fibonacci_levels(df)
+        trend = detect_trendline(df)
+        volume_status, volume_strength = analyze_volume(df)
+        signal, confidence, bull_signals, bear_signals = generate_signal(df, smc_data)
+        patterns = detect_all_patterns(df)
+        
+        current_price = float(df['close'].iloc[-1])
+        
+        analysis = {
+            "symbol": symbol,
+            "exchange": "BINANCE",
+            "timeframe": timeframe,
+            "source": "DataSectors",
+            "current_price": current_price,
+            "signal": signal,
+            "confidence": round(confidence, 2),
+            "bullish_signals": bull_signals,
+            "bearish_signals": bear_signals,
+            "trend": trend,
+            "total_candles": len(df),
+            "moving_averages": {
+                "MA12": safe_float(df['MA12'].iloc[-1]),
+                "MA26": safe_float(df['MA26'].iloc[-1]),
+                "MA50": safe_float(df['MA50'].iloc[-1]),
+                "MA200": safe_float(df['MA200'].iloc[-1]),
+                "EMA9": safe_float(df['EMA9'].iloc[-1]),
+                "EMA21": safe_float(df['EMA21'].iloc[-1])
+            },
+            "rsi": safe_float(df['RSI'].iloc[-1]),
+            "macd": {
+                "macd": safe_float(df['MACD'].iloc[-1]),
+                "signal": safe_float(df['MACD_signal'].iloc[-1]),
+                "histogram": safe_float(df['MACD_hist'].iloc[-1])
+            },
+            "stochastic": {
+                "k": safe_float(df['STOCH_K'].iloc[-1]),
+                "d": safe_float(df['STOCH_D'].iloc[-1])
+            },
+            "atr": safe_float(df['ATR'].iloc[-1]),
+            "bollinger_bands": {
+                "upper": safe_float(df['BB_upper'].iloc[-1]),
+                "middle": safe_float(df['BB_middle'].iloc[-1]),
+                "lower": safe_float(df['BB_lower'].iloc[-1])
+            },
+            "support_levels": [float(s) for s in supports],
+            "resistance_levels": [float(r) for r in resistances],
+            "fibonacci": {k: float(v) for k, v in fib_levels.items()},
+            "volume": {
+                "status": volume_status,
+                "strength": volume_strength,
+                "obv": safe_float(df['OBV'].iloc[-1])
+            },
+            "patterns": patterns,
+            "orderbook_walls": walls_data,
+            "smart_money_concepts": {
+                "smc_bias": smc_data.get('smc_bias', 'NEUTRAL'),
+                "smc_signal_strength": smc_data.get('smc_signal_strength', 50),
+                "smc_signal_count": smc_data.get('smc_signal_count', 0)
+            }
+        }
+        
+        # Save to database
+        conn = sqlite3.connect('crypto_scanner.db')
+        c = conn.cursor()
+        c.execute("""INSERT INTO scan_history 
+                     (user_id, ticker, timeframe, signal, confidence, price, analysis) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  (payload['user_id'], symbol, timeframe, 
+                   signal, confidence, current_price, safe_json_dumps(analysis)))
+        conn.commit()
+        conn.close()
+        
+        return analysis
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Scan error: {e}")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+
+@app.post("/api/datasectors/scan/stock")
+async def scan_stock_datasectors(
+    symbol: str,
+    timeframe: str = 'D',
+    market: str = 'id-id',
+    payload: dict = Depends(verify_token)
+):
+    """
+    Scan Indonesia stock using DataSectors API
+    """
+    try:
+        # Format symbol for DataSectors (XIDX:BBCA for Indonesian stocks)
+        ds_symbol = f"XIDX:{symbol.upper()}"
+        
+        # Fetch OHLCV data
+        df = fetch_datasectors_ohlcv(ds_symbol, timeframe, 1000)
+        
+        if df is None or len(df) < 50:
+            raise HTTPException(status_code=400, detail="Insufficient data for analysis")
+        
+        # Get stock info
+        stock_info = get_datasectors_stock_info(symbol, market)
+        
+        # Perform technical analysis
+        df, smc_data = perform_full_analysis(df)
+        
+        # Generate signals
+        supports, resistances = find_support_resistance(df)
+        fib_levels = calculate_fibonacci_levels(df)
+        trend = detect_trendline(df)
+        volume_status, volume_strength = analyze_volume(df)
+        signal, confidence, bull_signals, bear_signals = generate_signal(df, smc_data)
+        patterns = detect_all_patterns(df)
+        
+        current_price = float(df['close'].iloc[-1])
+        
+        analysis = {
+            "symbol": symbol,
+            "exchange": "XIDX",
+            "market": market,
+            "timeframe": timeframe,
+            "source": "DataSectors",
+            "current_price": current_price,
+            "signal": signal,
+            "confidence": round(confidence, 2),
+            "bullish_signals": bull_signals,
+            "bearish_signals": bear_signals,
+            "trend": trend,
+            "total_candles": len(df),
+            "stock_info": stock_info.get('data'),
+            "moving_averages": {
+                "MA12": safe_float(df['MA12'].iloc[-1]),
+                "MA26": safe_float(df['MA26'].iloc[-1]),
+                "MA50": safe_float(df['MA50'].iloc[-1]),
+                "MA200": safe_float(df['MA200'].iloc[-1]),
+                "EMA9": safe_float(df['EMA9'].iloc[-1]),
+                "EMA21": safe_float(df['EMA21'].iloc[-1])
+            },
+            "rsi": safe_float(df['RSI'].iloc[-1]),
+            "macd": {
+                "macd": safe_float(df['MACD'].iloc[-1]),
+                "signal": safe_float(df['MACD_signal'].iloc[-1]),
+                "histogram": safe_float(df['MACD_hist'].iloc[-1])
+            },
+            "stochastic": {
+                "k": safe_float(df['STOCH_K'].iloc[-1]),
+                "d": safe_float(df['STOCH_D'].iloc[-1])
+            },
+            "atr": safe_float(df['ATR'].iloc[-1]),
+            "bollinger_bands": {
+                "upper": safe_float(df['BB_upper'].iloc[-1]),
+                "middle": safe_float(df['BB_middle'].iloc[-1]),
+                "lower": safe_float(df['BB_lower'].iloc[-1])
+            },
+            "support_levels": [float(s) for s in supports],
+            "resistance_levels": [float(r) for r in resistances],
+            "fibonacci": {k: float(v) for k, v in fib_levels.items()},
+            "volume": {
+                "status": volume_status,
+                "strength": volume_strength,
+                "obv": safe_float(df['OBV'].iloc[-1])
+            },
+            "patterns": patterns
+        }
+        
+        # Save to database
+        conn = sqlite3.connect('crypto_scanner.db')
+        c = conn.cursor()
+        c.execute("""INSERT INTO scan_history 
+                     (user_id, ticker, timeframe, signal, confidence, price, analysis) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  (payload['user_id'], symbol, timeframe, 
+                   signal, confidence, current_price, safe_json_dumps(analysis)))
+        conn.commit()
+        conn.close()
+        
+        return analysis
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Stock scan error: {e}")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
